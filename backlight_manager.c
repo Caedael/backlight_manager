@@ -33,6 +33,20 @@
 #include <sys/types.h>
 
 #define MAX_PATH_LENGTH 512
+#define PID_FILE_PATH "/tmp/backlight_manager.pid"
+#define FIFO_PATH "/tmp/backlight_manager.pipe"
+
+typedef struct{
+  int brightness_adjustment;
+  bool ambient_mode;
+} PipeData;
+
+void signal_handler(int signal) {
+  if (remove(PID_FILE_PATH) == -1) {
+    perror("Error removing the PID file");
+  }
+  exit(0);
+}
 
 // Function to get the path of the brightness sensor
 char* get_sensor_path(const char* devices_path, const char* filename) {
@@ -92,6 +106,7 @@ typedef struct {
   char screen_backlight_path[256];
   double brightness_factor;
   int update_rate;
+  int min_brightness;
 } ConfigData;
 
 // Function to read configuration data from the config file
@@ -116,6 +131,8 @@ ConfigData read_config_data() {
           strncpy(config.screen_backlight_path, value, sizeof(config.screen_backlight_path));
         } else if (strcmp(key, "update_rate") == 0) {
           config.update_rate = atoi(value);
+        } else if (strcmp(key, "min_brightness") == 0) {
+            config.min_brightness = atoi(value);
         } else if (strcmp(key, "brightness_factor") == 0) {
           sscanf(value, "%lf", &config.brightness_factor);
         }
@@ -192,23 +209,173 @@ void print_info(const ConfigData* config) {
   printf("  Brightness Factor: %f\n", config->brightness_factor);
 }
 
+// Adjust brightness in percent
+void adjust_brightness(int value, int max_screen_brightness, const ConfigData* config) {
+    int current_screen_brightness = read_file(config->screen_backlight_path, "actual_brightness");
+    set_backlight_brightness(config->screen_backlight_path, current_screen_brightness + (int)((max_screen_brightness / 100.0) * value), max_screen_brightness);
+}
+
+// Start backlight_manager as daemon
+void start_daemon() {
+  // Fork and exit the parent process
+  pid_t pid = fork();
+  if (pid < 0) {
+    perror("Error forking the process");
+    exit(EXIT_FAILURE);
+  }
+  else if (pid > 0) {
+    // Parent process exits
+    exit(0);
+  }
+
+  // Create a new session
+  if (setsid() < 0) {
+    perror("Error creating a new session");
+    exit(EXIT_FAILURE);
+  }
+
+  chdir("/");
+
+  // Change file mode mask to 0 to enable full permissions (optional)
+  umask(0);
+
+  // Close standard file descriptors
+  close(STDIN_FILENO);
+  close(STDOUT_FILENO);
+  close(STDERR_FILENO);
+
+  // Open standard file descriptors to /dev/null
+  open("/dev/null", O_RDONLY); // STDIN_FILENO
+  open("/dev/null", O_WRONLY); // STDOUT_FILENO
+  open("/dev/null", O_RDWR);   // STDERR_FILENO
+
+  // Set up signal handlers to handle termination signals
+  signal(SIGTERM, signal_handler);
+  signal(SIGINT, signal_handler);
+
+  // Create the PID file and write the PID to it
+  FILE* pid_file = fopen(PID_FILE_PATH, "w");
+  if (pid_file == NULL) {
+    perror("Error creating the PID file");
+    exit(EXIT_FAILURE);
+  }
+  fprintf(pid_file, "%d", (int)getpid());
+  fclose(pid_file);
+    mkfifo(FIFO_PATH, 0666);
+}
+
+int open_pipe() {
+    // Open the named pipe in read-only mode
+    int fd = open(FIFO_PATH, O_RDONLY | O_NONBLOCK);
+
+    if (fd == -1) {
+        perror("Error opening the named pipe");
+        exit(EXIT_FAILURE);
+    }
+    return fd;
+}
+
+void stop_daemon() {
+  FILE* pid_file = fopen(PID_FILE_PATH, "r");
+  if (pid_file == NULL) {
+    perror("Error opening the PID file");
+    return;
+  }
+
+  // Read the PID from the file
+  pid_t pid;
+  if (fscanf(pid_file, "%d", &pid) == 1) {
+    // Send the termination signal (SIGTERM) to the daemon process
+    if (kill(pid, SIGTERM) == -1) {
+      perror("Error sending the termination signal to the daemon");
+    }
+    else {
+      printf("Termination signal sent to the daemon (PID: %d)\n", (int)pid);
+    }
+  }
+  else {
+    printf("Invalid PID file content\n");
+  }
+
+  // Close the PID file
+  fclose(pid_file);
+
+  // Remove the PID file
+  if (remove(PID_FILE_PATH) == -1) {
+    perror("Error removing the PID file");
+  }
+
+
+    // Remove the PID file
+    if (remove(FIFO_PATH) == -1) {
+        perror("Error removing the PID file");
+    }
+}
+
+void write_fifo(int value, bool ambient) {
+    // Open the named pipe in write-only mode
+    int fd = open(FIFO_PATH, O_WRONLY);
+
+    if (fd == -1) {
+        perror("Error opening the named pipe");
+        exit(EXIT_FAILURE);
+    }
+    PipeData data;
+    data.brightness_adjustment = value;
+    data.ambient_mode = ambient;
+
+    // Send the int8 value (example: 42)
+    ssize_t bytes_written = write(fd, &data, sizeof(data));
+
+    // Close the pipe and exit
+    close(fd);
+}
+
+PipeData* read_fifo(int fd) {
+    PipeData* value = (PipeData*) malloc(sizeof(PipeData));
+
+    if (value == NULL) {
+        perror("Error allocating memory for PipeData");
+        return NULL;
+    }
+
+    ssize_t bytes_read = read(fd, value, sizeof(PipeData));
+
+    if (bytes_read < 0) {
+        perror("Error reading from the named pipe");
+        free(value);
+        return NULL;
+    } else if (bytes_read == 0) {
+        // No data was read (end of file or pipe)
+        free(value);
+        return NULL;
+    }
+
+    return value;
+}
+
 int main(int argc, char* argv[]) {
-  int ambient_mode = 0; // Default value: ambient mode disabled
+  bool ambient_mode = false; // Default value: ambient mode disabled
   int brightness_adjustment = 0; // Default value: no brightness adjustment
+  bool daemon_mode = false; // Default value: dont run as daemon
   bool print_status = false; // Default value: do not print status
   ConfigData config = read_config_data();
-
+  int fd = 0;
   // Parse command-line options using getopt
 
   int option;
-  const char* short_options = "hapeds:k:b:";
+  const char* short_options = "hpdkas:";
   static struct option long_options[] = {
     {"help", no_argument, NULL, 'h'},
     {"ambient", no_argument, NULL, 'a'},
+    {"daemon", no_argument, NULL, 'd'},
+    {"kill", no_argument, NULL, 'k'},
     {"print-status", no_argument, NULL, 'p'},
     {"set", required_argument, NULL, 's'},
     {NULL, 0, NULL, 0}
   };
+
+  FILE* pid_file = fopen(PID_FILE_PATH, "r");
 
   while ((option = getopt_long(argc, argv, short_options, long_options, NULL)) != -1) {
     switch (option) {
@@ -216,8 +383,17 @@ int main(int argc, char* argv[]) {
         display_usage();
         return 0;
       case 'a':
-        ambient_mode = 1;
+        ambient_mode = true;
         break;
+      case 'd':
+          if (pid_file == NULL) {
+              start_daemon();
+          }
+        daemon_mode = true;
+        break;
+      case 'k':
+        stop_daemon();
+        exit(EXIT_SUCCESS);
       case 'p':
         print_status = true;
         break;
@@ -235,21 +411,45 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
-  int max_screen_brightness = read_file(config.screen_backlight_path, "max_brightness");
-
-  if (brightness_adjustment != 0) {
-    int current_screen_brightness = read_file(config.screen_backlight_path, "actual_brightness");
-    set_backlight_brightness(config.screen_backlight_path, current_screen_brightness + (int)((max_screen_brightness / 100.0) * brightness_adjustment), max_screen_brightness);
+  if (daemon_mode) {
+      fd = open_pipe();
   }
 
+    int max_screen_brightness = read_file(config.screen_backlight_path, "max_brightness");
+    config.min_brightness = (int)((max_screen_brightness / 100.0) * config.min_brightness);
+    if (pid_file == NULL) {
 
-  while (ambient_mode) {
-    double illumination = read_file(config.sensor_file_path, config.sensor_file);
+        if (brightness_adjustment != 0) {
+            adjust_brightness(brightness_adjustment, max_screen_brightness, &config);
+        }
+    } else if (!daemon_mode){
+        write_fifo(brightness_adjustment, ambient_mode);
+    }
 
-    int backlight_value = (int)(illumination * config.brightness_factor);
 
-    set_backlight_brightness(config.screen_backlight_path, backlight_value, max_screen_brightness);
-
+  while (daemon_mode) {
+    PipeData* data = read_fifo(fd);
+    if (data != NULL) {
+      brightness_adjustment = data->brightness_adjustment;
+      if (data->ambient_mode) {
+          if (ambient_mode) {
+              ambient_mode = !data->ambient_mode;
+          } else {
+              ambient_mode = data->ambient_mode;
+          }
+      }
+      free(data);
+    }
+    if (brightness_adjustment != 0) {
+      adjust_brightness(brightness_adjustment, max_screen_brightness, &config);
+      brightness_adjustment = 0;
+    }
+    if (ambient_mode) {
+      double illumination = read_file(config.sensor_file_path, config.sensor_file);
+      int tmp_backlight_value = (int)(illumination * config.brightness_factor);
+      int backlight_value = (tmp_backlight_value > config.min_brightness) ? tmp_backlight_value : config.min_brightness;
+      set_backlight_brightness(config.screen_backlight_path, backlight_value, max_screen_brightness);
+    }
     sleep(config.update_rate);
   }
 
