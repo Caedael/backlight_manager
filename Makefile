@@ -4,7 +4,7 @@
 CC := gcc
 
 # Compiler flags
-CFLAGS := -Wall -Wextra -std=c11
+CFLAGS := -Wall -Wextra
 
 # Program source files
 SRCS := backlight_manager.c
